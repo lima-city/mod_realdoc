@@ -189,17 +189,20 @@ static apr_status_t realdoc_restore_docroot(void *data) {
 }
 
 static int realdoc_hook_handler(request_rec *r) {
-    core_server_config *core_conf;
-    realdoc_config_struct *realdoc_conf;
+    core_server_config *core_conf = ap_get_module_config(r->server->module_config, &core_module);
+    realdoc_config_struct *realdoc_conf = (realdoc_config_struct *) ap_get_module_config(r->server->module_config, &realdoc_module);
+
+    // Skip if RealpathEvery is not configured
+    if (!realdoc_conf->realpath_every) {
+        return DECLINED;
+    }
+
     realdoc_request_save_struct *save;
     char *last_saved_real_docroot;
     apr_time_t *last_saved_real_time;
     apr_time_t current_request_time;
     const char *last_saved_docroot_key = apr_psprintf(r->pool, "%s:%u:realdoc_saved_docroot", ap_get_server_name(r), ap_get_server_port(r));
     const char *last_saved_time_key = apr_psprintf(r->pool, "%s:%u:realdoc_saved_time", ap_get_server_name(r), ap_get_server_port(r));
-
-    core_conf = ap_get_module_config(r->server->module_config, &core_module);
-    realdoc_conf = (realdoc_config_struct *) ap_get_module_config(r->server->module_config, &realdoc_module);
 
     apr_pool_userdata_get((void **) &last_saved_real_docroot, last_saved_docroot_key, r->server->process->pool);
 
