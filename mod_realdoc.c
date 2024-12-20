@@ -48,7 +48,20 @@ typedef struct {
     apr_time_t realpath_every;
     unsigned int use_readlink;
     const char *prefix_path;
+    apr_thread_mutex_t *mutex;
 } realdoc_config_struct;
+
+typedef struct {
+    const char *resolved_docroot;
+    unsigned int is_resolved;
+} realdoc_request_config;
+
+typedef struct
+{
+    char path[PATH_MAX];
+    apr_time_t timestamp;
+    const char *original_docroot; // Store original with the cache entry
+} cache_entry;
 
 #define AP_LOG_DEBUG(rec, fmt, ...) ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, rec, "[realdoc] " fmt, ##__VA_ARGS__)
 #define AP_LOG_ERROR(rec, fmt, ...) ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, rec, "[realdoc] " fmt, ##__VA_ARGS__)
@@ -57,7 +70,22 @@ module AP_MODULE_DECLARE_DATA realdoc_module;
 
 static void *create_realdoc_config(apr_pool_t *p, server_rec *d)
 {
-    return apr_pcalloc(p, sizeof(realdoc_config_struct));
+    realdoc_config_struct *conf = (realdoc_config_struct *) apr_pcalloc(p, sizeof(realdoc_config_struct));
+
+    if (!conf) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, d, "[realdoc] Failed to allocate realdoc config");
+        return NULL;
+    }
+
+    apr_status_t rv = apr_thread_mutex_create(&conf->mutex, APR_THREAD_MUTEX_UNNESTED, p);
+    if (rv != APR_SUCCESS) {
+        char errbuf[256];
+        ap_log_error(APLOG_MARK, APLOG_ERR, rv, d, "[realdoc] Failed to create mutex: %s",
+                    apr_strerror(rv, errbuf, sizeof(errbuf)));
+        return NULL;
+    }
+
+    return conf;
 }
 
 static void *merge_realdoc_config(apr_pool_t *p, void *basev, void *addv)
@@ -70,6 +98,7 @@ static void *merge_realdoc_config(apr_pool_t *p, void *basev, void *addv)
     new->realpath_every = add->realpath_every ? add->realpath_every : base->realpath_every;
     new->use_readlink = add->use_readlink ? add->use_readlink : base->use_readlink;
     new->prefix_path = add->prefix_path ? add->prefix_path : base->prefix_path;
+    new->mutex = base->mutex;
     return new;
 }
 
@@ -182,10 +211,31 @@ static const command_rec realdoc_cmds[] =
     {NULL}
 };
 
-static apr_status_t realdoc_restore_docroot(void *data) {
-    realdoc_request_save_struct *save = (realdoc_request_save_struct *)data;
-    *save->docroot  = save->original;
-    return APR_SUCCESS;
+static realdoc_request_config *get_realdoc_request_config(request_rec *r)
+{
+    realdoc_request_config *reqc;
+
+    // walk to main request
+    while (r->main != NULL) {
+        //AP_LOG_ERROR(APLOG_MARK, APLOG_DEBUG, 0, r->server, "realdoc: request %d has main request %d ***", r, r->main);
+        r = r->main;
+    }
+
+    // walk to first request of internal redirect chain
+    while (r->prev != NULL) {
+        //AP_LOG_ERROR(APLOG_MARK, APLOG_DEBUG, 0, r->server, "realdoc: request %d has previous request %d ***", r, r->prev);
+        r = r->prev;
+    }
+
+    reqc = ap_get_module_config(r->request_config, &realdoc_module);
+    if (!reqc) {
+        //AP_LOG_ERROR(APLOG_MARK, APLOG_DEBUG, 0, r->server, "realdoc: variable reqc does not exists.... creating ! pid=%d request_rec=%d @request_config='%d'", getpid(), r, &(r->request_config));
+        reqc = (realdoc_request_config *) apr_pcalloc(r->pool, sizeof(realdoc_request_config));
+        reqc->is_resolved = 0;
+        ap_set_module_config(r->request_config, &realdoc_module, reqc);
+    }
+
+    return reqc;
 }
 
 static int realdoc_hook_handler(request_rec *r) {
@@ -197,83 +247,110 @@ static int realdoc_hook_handler(request_rec *r) {
         return DECLINED;
     }
 
-    realdoc_request_save_struct *save;
-    char *last_saved_real_docroot;
-    apr_time_t *last_saved_real_time;
-    apr_time_t current_request_time;
-    const char *last_saved_docroot_key = apr_psprintf(r->pool, "%s:%u:realdoc_saved_docroot", ap_get_server_name(r), ap_get_server_port(r));
-    const char *last_saved_time_key = apr_psprintf(r->pool, "%s:%u:realdoc_saved_time", ap_get_server_name(r), ap_get_server_port(r));
-
-    apr_pool_userdata_get((void **) &last_saved_real_docroot, last_saved_docroot_key, r->server->process->pool);
-
-    /* Guard against being run a second time on the same request */
-    if(core_conf->ap_document_root == last_saved_real_docroot) {
+    realdoc_request_config *req_cfg = get_realdoc_request_config(r);
+    if(req_cfg->is_resolved) {
         return DECLINED;
     }
 
-    /* Grab the current docroot address and value and save it
-       so we can restore it in our cleanup func */
-    save = apr_pcalloc(r->pool, sizeof(realdoc_request_save_struct));
-    save->docroot = &core_conf->ap_document_root;
-    save->original = core_conf->ap_document_root;
+    apr_time_t current_request_time = apr_time_sec(r->request_time);
+    const char *cache_key = apr_psprintf(r->pool, "%s:%u:realdoc_cache",
+                                       ap_get_server_name(r), ap_get_server_port(r));
 
-    apr_pool_cleanup_register(r->pool, save, realdoc_restore_docroot, realdoc_restore_docroot);
-    current_request_time = apr_time_sec(r->request_time);
+    cache_entry *cached_data;
 
-    apr_pool_userdata_get((void **) &last_saved_real_time, last_saved_time_key, r->server->process->pool);
-    if (!last_saved_real_time) {
-        last_saved_real_time = apr_pcalloc(r->server->process->pool, sizeof(apr_time_t));
-        if (!last_saved_real_time) {
-            AP_LOG_ERROR(r, "Failed to allocate memory for saving time data");
-            return DECLINED;
-        } else {
-            apr_pool_userdata_set((const void *) last_saved_real_time, last_saved_time_key, NULL,
-                    r->server->process->pool);
-        }
+    // Lock for thread safety
+    apr_status_t mutex_rv = apr_thread_mutex_lock(realdoc_conf->mutex);
+    if (mutex_rv != APR_SUCCESS) {
+        AP_LOG_ERROR(r, "Failed to acquire mutex");
+        return DECLINED;
     }
 
-    if (!last_saved_real_docroot) {
-        last_saved_real_docroot = apr_pcalloc(r->server->process->pool, PATH_MAX * sizeof(char));
-        if (!last_saved_real_docroot) {
-            AP_LOG_ERROR(r, "Failed to allocate memory for saving docroot data");
-            return DECLINED;
-        } else {
-            apr_pool_userdata_set((const void *) last_saved_real_docroot, last_saved_docroot_key, NULL,
-                    r->server->process->pool);
-        }
+    // Always restore original docroot from previous cache entry if it exists
+    apr_pool_userdata_get((void **)&cached_data, cache_key, r->server->process->pool);
+    if (cached_data && cached_data->original_docroot) {
+        core_conf->ap_document_root = cached_data->original_docroot;
     }
 
-    if (*last_saved_real_time < (current_request_time - realdoc_conf->realpath_every)) {
+    // Check if we need to resolve the path (cache miss or expired)
+    if (!cached_data ||
+        (current_request_time - cached_data->timestamp) > realdoc_conf->realpath_every) {
+
+        // Allocate new cache entry if needed
+        if (!cached_data) {
+            cached_data = apr_pcalloc(r->server->process->pool, sizeof(cache_entry));
+            if (!cached_data) {
+                AP_LOG_ERROR(r, "Failed to allocate memory for cache entry");
+                apr_thread_mutex_unlock(realdoc_conf->mutex);
+                return DECLINED;
+            }
+        }
+
+        // Store original docroot before modification
+        cached_data->original_docroot = core_conf->ap_document_root;
+
+        // Resolve the path
         if (realdoc_conf->use_readlink) {
             if (realdoc_conf->prefix_path) {
-                strcpy(last_saved_real_docroot, realdoc_conf->prefix_path);
+                strcpy(cached_data->path, realdoc_conf->prefix_path);
             }
-            AP_LOG_DEBUG(r, "PID %d calling first_link(). Original docroot: %s. Buffer: %s", getpid(), core_conf->ap_document_root, last_saved_real_docroot);
-            if (-1 == first_link((char *)core_conf->ap_document_root, last_saved_real_docroot)) {
-                AP_LOG_ERROR(r, "Error from readlink: %d. Original docroot: %s", errno, core_conf->ap_document_root);
+            if (-1 == first_link((char *)core_conf->ap_document_root, cached_data->path)) {
+                AP_LOG_ERROR(r, "Error from readlink: %d. Original docroot: %s",
+                           errno, core_conf->ap_document_root);
+                apr_thread_mutex_unlock(realdoc_conf->mutex);
                 return DECLINED;
             }
         } else {
-            if (NULL == realpath(core_conf->ap_document_root, last_saved_real_docroot)) {
-                AP_LOG_ERROR(r, "Error from realpath: %d. Original docroot: %s", errno, core_conf->ap_document_root);
+            if (NULL == realpath(core_conf->ap_document_root, cached_data->path)) {
+                AP_LOG_ERROR(r, "Error from realpath: %d. Original docroot: %s",
+                           errno, core_conf->ap_document_root);
+                apr_thread_mutex_unlock(realdoc_conf->mutex);
                 return DECLINED;
             }
         }
 
-        if (realdoc_conf->use_readlink) {
-            AP_LOG_DEBUG(r, "PID %d calling readlink. Original docroot: %s. Resolved: %s", getpid(), core_conf->ap_document_root, last_saved_real_docroot);
-        } else {
-            AP_LOG_DEBUG(r, "PID %d calling realpath. Original docroot: %s. Resolved: %s", getpid(), core_conf->ap_document_root, last_saved_real_docroot);
-        }
-        *last_saved_real_time = current_request_time;
+        // Update cache timestamp and store in pool userdata
+        cached_data->timestamp = current_request_time;
+        apr_pool_userdata_set(cached_data, cache_key, NULL, r->server->process->pool);
+
+        AP_LOG_DEBUG(r, "Updated cache - Original docroot: %s. Resolved: %s",
+                    core_conf->ap_document_root, cached_data->path);
+    } else {
+        AP_LOG_DEBUG(r, "Using cached data - Original docroot: %s. Resolved: %s",
+                     core_conf->ap_document_root, cached_data->path);
     }
 
-    core_conf->ap_document_root = last_saved_real_docroot;
+    // Set the resolved path in request config
+    req_cfg->is_resolved = 1;
+    req_cfg->resolved_docroot = apr_pstrdup(r->pool, cached_data->path);
+
+    AP_LOG_DEBUG(r, "Using docroot - Original: %s, Resolved: %s",
+                core_conf->ap_document_root, cached_data->path);
+
+    apr_status_t unlock_rv = apr_thread_mutex_unlock(realdoc_conf->mutex);
+    if (unlock_rv != APR_SUCCESS) {
+        AP_LOG_ERROR(r, "Failed to release mutex");
+    }
     return DECLINED;
 }
 
-void realdoc_register_hook(apr_pool_t *p) {
-    ap_hook_post_read_request(realdoc_hook_handler, NULL, NULL, APR_HOOK_REALLY_FIRST);
+static int realdoc_translate_name(request_rec *r)
+{
+    realdoc_request_config *req_cfg = get_realdoc_request_config(r);
+    if(!req_cfg->is_resolved) {
+        return DECLINED;
+    }
+
+    ap_set_document_root(r, req_cfg->resolved_docroot);
+
+    return DECLINED;
+}
+
+void realdoc_register_hook(apr_pool_t *p)
+{
+    static const char *const aszPre[] = {"mod_alias.c", "mod_userdir.c", NULL};
+
+    ap_hook_post_read_request(realdoc_hook_handler, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_translate_name(realdoc_translate_name, aszPre, NULL, APR_HOOK_MIDDLE);
 }
 
 AP_MODULE_DECLARE_DATA module realdoc_module = {
